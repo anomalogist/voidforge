@@ -1,0 +1,36 @@
+[package]
+name = "voidforge"
+version = "1.0.0"
+description = "The Visual Package Workshop for Void Linux — terminal edition"
+license = "MIT"
+readme = "README.md"
+keywords = ["void-linux", "xbps", "packaging", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+edition = "2021"
+rust-version = "1.89"
+default-run = "voidforge"
+
+[lib]
+name = "voidforge_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voidforge"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+rusqlite = { version = "0.43", features = ["bundled"] }
+sysinfo = "0.37"
+serde_json = "1"
+thiserror = "2"
+regex = "1"
+sha2 = "0.11"
+libc = "0.2"
+chrono = "0.4"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
