@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{invalid, Error, Result};
 use crate::models::TemplateInfo;
+use crate::utils::path::in_workspace;
 
 #[derive(Clone, Debug)]
 pub struct Distfile {
@@ -71,18 +73,40 @@ fn sha256(path: &Path) -> Result<String> {
         .collect())
 }
 
+/// Find a distfile without following symlinks or walking into a symlink loop.
+/// Templates and cached trees are user-controlled data, so neither recursion
+/// nor hashing may escape the cache directory.
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    if !root.is_dir() {
+    let mut visited = HashSet::new();
+    find_file_inner(root, name, 0, &mut visited)
+}
+
+fn find_file_inner(
+    root: &Path,
+    name: &str,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    if depth > 8 || !visited.insert(root.canonicalize().ok()?) {
         return None;
     }
     let direct = root.join(name);
-    if direct.is_file() {
-        return Some(direct);
+    if let Ok(meta) = std::fs::symlink_metadata(&direct) {
+        if meta.is_file() {
+            return Some(direct);
+        }
     }
     for entry in std::fs::read_dir(root).ok()?.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_file(&path, name) {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            if let Some(found) = find_file_inner(&path, name, depth + 1, visited) {
                 return Some(found);
             }
         } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
@@ -101,18 +125,49 @@ fn safe_filename(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+/// Resolve the cache directory and make sure a symlinked template name cannot
+/// turn it into a pointer outside the workspace.
+fn safe_cache_dir(workspace: &Path, info: &TemplateInfo) -> Result<PathBuf> {
+    let directory = cache_dir(workspace, info);
+    std::fs::create_dir_all(&directory)?;
+    let real = directory
+        .canonicalize()
+        .map_err(|_| invalid("could not resolve the source cache directory"))?;
+    if !in_workspace(&real, workspace) {
+        return Err(invalid("source cache escapes the workspace"));
+    }
+    Ok(real)
+}
+
 pub fn download(workspace: &Path, info: &TemplateInfo, index: usize) -> Result<PathBuf> {
     let files = distfiles(info);
     let item = files
         .get(index)
         .ok_or_else(|| invalid("distfile index is out of range"))?;
     let filename = safe_filename(&item.filename)?;
-    let directory = cache_dir(workspace, info);
-    std::fs::create_dir_all(&directory)?;
+    let directory = safe_cache_dir(workspace, info)?;
     let destination = directory.join(filename);
+    if let Ok(meta) = std::fs::symlink_metadata(&destination) {
+        if meta.file_type().is_symlink() {
+            return Err(invalid(format!(
+                "refusing to write through a symlink: {}",
+                destination.display()
+            )));
+        }
+    }
     let output = Command::new("curl")
-        .args(["-fL", "--retry", "2", "-o"])
+        .args([
+            "-fL",
+            "--retry",
+            "2",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "120",
+            "-o",
+        ])
         .arg(&destination)
+        .arg("--")
         .arg(&item.url)
         .output()?;
     if !output.status.success() {
@@ -126,7 +181,10 @@ pub fn download(workspace: &Path, info: &TemplateInfo, index: usize) -> Result<P
 }
 
 pub fn verify(workspace: &Path, info: &TemplateInfo) -> Vec<(Distfile, Option<String>, bool)> {
-    let directory = cache_dir(workspace, info);
+    let directory = match safe_cache_dir(workspace, info) {
+        Ok(directory) => directory,
+        Err(_) => return Vec::new(),
+    };
     distfiles(info)
         .into_iter()
         .map(|item| {
@@ -142,7 +200,7 @@ pub fn verify(workspace: &Path, info: &TemplateInfo) -> Vec<(Distfile, Option<St
 
 pub fn extract(workspace: &Path, info: &TemplateInfo, filename: &str) -> Result<PathBuf> {
     let filename = safe_filename(filename)?;
-    let directory = cache_dir(workspace, info);
+    let directory = safe_cache_dir(workspace, info)?;
     let archive = find_file(&directory, filename)
         .ok_or_else(|| invalid(format!("archive not found: {filename}")))?;
     let target = directory.join("extracted");
@@ -163,6 +221,20 @@ pub fn extract(workspace: &Path, info: &TemplateInfo, filename: &str) -> Result<
     Ok(target)
 }
 
+fn github_segment(segment: &str) -> Result<&str> {
+    let segment = segment.strip_suffix(".git").unwrap_or(segment);
+    if segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || !segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+    {
+        return Err(invalid(format!("invalid GitHub URL segment: {segment}")));
+    }
+    Ok(segment)
+}
+
 pub fn github_latest(repo_url: &str) -> Result<String> {
     let trimmed = repo_url.trim_end_matches('/');
     let prefix = "https://github.com/";
@@ -170,13 +242,12 @@ pub fn github_latest(repo_url: &str) -> Result<String> {
         .strip_prefix(prefix)
         .ok_or_else(|| invalid("expected a https://github.com/owner/repo URL"))?;
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+    if parts.len() < 2 {
         return Err(invalid("GitHub URL must include owner and repository"));
     }
-    let api = format!(
-        "https://api.github.com/repos/{}/{}/releases/latest",
-        parts[0], parts[1]
-    );
+    let owner = github_segment(parts[0])?;
+    let repo = github_segment(parts[1])?;
+    let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
     let output = Command::new("curl")
         .args(["-fsSL", "--max-time", "20", &api])
         .output()?;
@@ -206,6 +277,17 @@ mod tests {
         assert!(safe_filename("../escape").is_err());
         assert!(safe_filename("a/b").is_err());
         assert!(safe_filename("..").is_err());
+    }
+
+    #[test]
+    fn validates_github_segments() {
+        assert_eq!(github_segment("void-linux").unwrap(), "void-linux");
+        assert_eq!(
+            github_segment("void-packages.git").unwrap(),
+            "void-packages"
+        );
+        assert!(github_segment("..").is_err());
+        assert!(github_segment("repo?x=1").is_err());
     }
 
     #[test]

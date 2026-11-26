@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::models::{Finding, Severity, TemplateInfo, Workspace};
+use crate::package::dependency_name;
 
 const REQUIRED: [&str; 7] = [
     "pkgname",
@@ -53,11 +54,13 @@ const KNOWN_STYLES: &[&str] = &[
     "zig-build",
 ];
 
-fn dep_name(raw: &str) -> &str {
-    raw.split(['<', '>', '=', '(', ')'])
-        .next()
-        .unwrap_or(raw)
-        .trim()
+fn build_style_exists(workspace: &Workspace, style: &str) -> bool {
+    workspace
+        .path
+        .join("common")
+        .join("build-style")
+        .join(format!("{style}.sh"))
+        .is_file()
 }
 
 pub fn validate(info: &TemplateInfo, workspace: &Workspace) -> Vec<Finding> {
@@ -76,16 +79,11 @@ pub fn validate(info: &TemplateInfo, workspace: &Workspace) -> Vec<Finding> {
     }
 
     let name = info.get("pkgname").unwrap_or("").trim();
-    if !name.is_empty()
-        && !name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
+    if !name.is_empty() && !crate::package::valid_name(name) {
         findings.push(
             Finding::error(
                 "invalid pkgname",
-                "Package names must start with a lowercase letter or digit",
+                "Package names must contain only ASCII letters, digits, +, -, _ or .",
             )
             .at_line(*info.lines.get("pkgname").unwrap_or(&0)),
         );
@@ -116,7 +114,10 @@ pub fn validate(info: &TemplateInfo, workspace: &Workspace) -> Vec<Finding> {
     }
 
     if let Some(style) = info.get("build_style") {
-        if !style.is_empty() && !KNOWN_STYLES.contains(&style) {
+        if !style.is_empty()
+            && !build_style_exists(workspace, style)
+            && !KNOWN_STYLES.contains(&style)
+        {
             findings.push(Finding::warning(
                 "unrecognized build_style",
                 format!("Verify that {style} exists in common/build-style"),
@@ -136,22 +137,41 @@ pub fn validate(info: &TemplateInfo, workspace: &Workspace) -> Vec<Finding> {
                 .at_line(*info.lines.get("checksum").unwrap_or(&0)),
             );
         } else {
-            let first = checksum.split_whitespace().next().unwrap_or("");
-            if first.len() != 64 || !first.chars().all(|c| c.is_ascii_hexdigit()) {
+            // A checksum may be one hash for every distfile or one per
+            // distfile. An `@` prefix asks xbps-src to hash archive contents.
+            let invalid = checksum
+                .split_whitespace()
+                .filter(|token| !token.contains('$'))
+                .find(|token| {
+                    let hash = token.strip_prefix('@').unwrap_or(token);
+                    hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit())
+                });
+            if let Some(token) = invalid {
                 findings.push(
                     Finding::error(
                         "invalid checksum",
-                        "checksum must start with a 64-character SHA256 hex value",
+                        format!(
+                            "`{token}` is not a 64-character SHA256 value (an optional @ prefix is allowed)"
+                        ),
                     )
                     .at_line(*info.lines.get("checksum").unwrap_or(&0)),
                 );
             }
         }
     } else if !checksum.is_empty() {
-        findings.push(Finding::warning(
-            "checksum without distfiles",
-            "No distfiles were declared for this checksum",
-        ));
+        // R-cran templates get their distfiles from the build style, so the
+        // checksum is correct even with no explicit `distfiles` assignment.
+        if info.get("build_style") == Some("R-cran") {
+            findings.push(Finding::info(
+                "checksum from build style",
+                "distfiles are supplied implicitly by the R-cran build style",
+            ));
+        } else {
+            findings.push(Finding::warning(
+                "checksum without distfiles",
+                "No distfiles were declared for this checksum",
+            ));
+        }
     }
 
     if info.get("version").is_some_and(|value| value.contains('$')) {
@@ -165,10 +185,11 @@ pub fn validate(info: &TemplateInfo, workspace: &Workspace) -> Vec<Finding> {
     for kind in ["depends", "makedepends", "hostmakedepends", "checkdepends"] {
         let line = *info.lines.get(kind).unwrap_or(&0);
         for item in info.list(kind) {
-            let dependency = dep_name(&item);
+            let dependency = dependency_name(&item);
             if dependency.is_empty() {
                 continue;
             }
+            let is_virtual = item.trim_start().starts_with("virtual?");
             if !seen.insert(format!("{kind}:{dependency}")) {
                 findings.push(
                     Finding::warning(
@@ -178,7 +199,12 @@ pub fn validate(info: &TemplateInfo, workspace: &Workspace) -> Vec<Finding> {
                     .at_line(line),
                 );
             }
-            if dependency != name && !workspace.path.join("srcpkgs").join(dependency).is_dir() {
+            // Virtual dependencies are satisfied by a provider's `provides`
+            // field, so there is no srcpkgs directory to look for.
+            if !is_virtual
+                && dependency != name
+                && !workspace.path.join("srcpkgs").join(&dependency).is_dir()
+            {
                 findings.push(
                     Finding::info(
                         "dependency not in repository",
@@ -261,5 +287,30 @@ mod tests {
         };
         let findings = validate(&template(""), &workspace);
         assert!(!findings.iter().any(|f| f.severity == Severity::Error));
+    }
+
+    #[test]
+    fn accepts_contents_checksum_and_virtual_dependency() {
+        let workspace = Workspace {
+            id: 0,
+            name: "w".into(),
+            path: PathBuf::from("/tmp/w"),
+            branch: String::new(),
+            remotes: vec![],
+            valid: true,
+            created_at: String::new(),
+        };
+        let mut info = template("");
+        info.vars.insert("distfiles".into(), "foo.tar.gz".into());
+        info.vars.insert(
+            "checksum".into(),
+            "@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        info.vars.insert("depends".into(), "virtual?python3".into());
+        let findings = validate(&info, &workspace);
+        assert!(!findings.iter().any(|f| f.title == "invalid checksum"));
+        assert!(!findings
+            .iter()
+            .any(|f| f.title == "dependency not in repository"));
     }
 }

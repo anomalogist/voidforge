@@ -3,3 +3,4 @@
 *.sqlite3-shm
 *.sqlite3-wal
 .DS_Store
+/tests/perf_local.rs

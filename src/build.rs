@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc::Sender, Arc, Mutex};
-use std::time::Instant;
+use std::sync::{mpsc, mpsc::Sender, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::error::{invalid, Result};
 use crate::events::UiEvent;
@@ -73,6 +73,7 @@ impl BuildManager {
         }
         command
             .env("XBPS_JOBS", jobs.to_string())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -111,10 +112,16 @@ impl BuildManager {
         let finished_log = log_path.clone();
         std::thread::spawn(move || {
             let status = child.wait();
-            // Wait for both readers to finish flushing before announcing the
-            // result, so `:diagnose last` always sees the complete log.
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            // Normally the readers are done by now. Give them a brief chance to
+            // flush so diagnostics see the complete log, but never let a
+            // grandchild holding a pipe hostage keep a build "running" forever.
+            let (flushed_tx, flushed_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                let _ = flushed_tx.send(());
+            });
+            let _ = flushed_rx.recv_timeout(Duration::from_millis(750));
             let (seconds, _) = match running
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -189,15 +196,37 @@ fn spawn_stream<R: std::io::Read + Send + 'static>(
     build_id: i64,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        for line in BufReader::new(reader)
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
-            if let Ok(mut handle) = file.lock() {
-                let _ = writeln!(handle, "{line}");
-                let _ = handle.flush();
+        let mut buffered = BufReader::new(reader);
+        let mut bytes = Vec::new();
+        let mut failures = 0usize;
+        loop {
+            bytes.clear();
+            match buffered.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {
+                    failures = 0;
+                    // xbps-src and their compilers routinely emit non-UTF-8
+                    // bytes. Losing the rest of a log because of one such line
+                    // would make diagnosis unreliable.
+                    let line = String::from_utf8_lossy(&bytes)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    if let Ok(mut handle) = file.lock() {
+                        let _ = writeln!(handle, "{line}");
+                        let _ = handle.flush();
+                    }
+                    let _ = tx.send(UiEvent::BuildLog {
+                        build_id,
+                        line: line.clone(),
+                    });
+                }
+                Err(_) => {
+                    failures += 1;
+                    if failures >= 10 {
+                        break;
+                    }
+                }
             }
-            let _ = tx.send(UiEvent::BuildLog { build_id, line });
         }
     })
 }

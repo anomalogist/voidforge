@@ -792,7 +792,7 @@ fn render_help(frame: &mut Frame, area: Rect, theme: Theme) {
             theme,
         ),
         row(
-            "5",
+            "6",
             "Patches: :patch new <name> to edit a package patch",
             theme,
         ),

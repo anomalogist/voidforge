@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,18 +22,52 @@ use crate::system;
 
 type Backend = CrosstermBackend<Stdout>;
 
+/// Always put the terminal back the way we found it, even if the event loop
+/// returns early or a key handler panics. A TUI that leaves raw mode enabled
+/// after a crash is infuriating to recover from.
+struct TerminalGuard {
+    armed: bool,
+}
+
+impl TerminalGuard {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        let mut stdout = io::stdout();
+        let raw = disable_raw_mode();
+        let screen = execute!(stdout, LeaveAlternateScreen, Show);
+        raw.and(screen)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 pub fn run() -> io::Result<()> {
-    let mut stdout = io::stdout();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        previous_hook(info);
+    }));
+
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    let mut guard = TerminalGuard::new();
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_app(&mut terminal);
-
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-    result
+    result.and(guard.restore())
 }
 
 fn run_app(terminal: &mut Terminal<Backend>) -> io::Result<()> {
@@ -86,15 +121,16 @@ fn edit_template(
 ) -> io::Result<()> {
     let editor = app.settings.editor.clone();
     disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
 
     let result = app::open_editor(&editor, &path.to_path_buf());
 
-    let _ = enable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
-    let _ = terminal.hide_cursor();
-    app.refresh_all();
+    // Restore the TUI before doing anything else, including on editor errors.
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, Hide)?;
+    if result.is_ok() {
+        app.refresh_all();
+    }
     match result {
         Ok(()) => app.notify(NoticeLevel::Success, "editor closed; template reloaded"),
         Err(error) => app.notify(NoticeLevel::Error, error.to_string()),

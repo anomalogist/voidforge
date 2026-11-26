@@ -1,6 +1,8 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
+use std::time::SystemTime;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sysinfo::{Disks, System};
@@ -136,6 +138,11 @@ pub struct App {
     pub builds_manager: BuildManager,
     pub active_build_id: Option<i64>,
     pub edit_request: Option<PathBuf>,
+    /// Whether the expensive workspace scan has been done in this session.
+    workspace_data_loaded: bool,
+    /// Parsed template and the file state it came from, so navigation does not
+    /// re-parse the same template over and over.
+    template_cache: Option<(PathBuf, SystemTime, u64)>,
 }
 
 impl App {
@@ -183,11 +190,13 @@ impl App {
             builds_manager: BuildManager::new(tx),
             active_build_id: None,
             edit_request: None,
+            workspace_data_loaded: false,
+            template_cache: None,
         };
         if !app.workspaces.is_empty() {
             app.active_ws = Some(0);
         }
-        app.refresh_all();
+        app.refresh_light();
         Ok(app)
     }
 
@@ -221,8 +230,27 @@ impl App {
         BuildOp::all()[self.build_op_index % BuildOp::all().len()]
     }
 
+    /// Light reload: workspaces, tool availability and build history. This is
+    /// cheap enough to run at startup; the expensive template scan is deferred
+    /// until the user actually needs package data.
+    fn refresh_light(&mut self) {
+        self.workspaces = db::workspaces(self.database.conn()).unwrap_or_default();
+        if self.workspaces.is_empty() {
+            self.active_ws = None;
+        } else {
+            self.active_ws = Some(self.active_ws.unwrap_or(0).min(self.workspaces.len() - 1));
+        }
+        let scopes: Vec<ToolScope> = self
+            .active_workspace()
+            .map(|ws| vec![ToolScope::Workspace(ws.path.clone())])
+            .unwrap_or_default();
+        self.tools = system::detect_tools(&scopes);
+        self.builds = db::builds(self.database.conn(), 100).unwrap_or_default();
+        self.refresh_selection();
+    }
+
     /// Full reload: settings, workspaces, package index, git state and the
-    /// selected package. Used on startup and after commands that change data.
+    /// selected package. Used after commands that change data.
     pub fn refresh_all(&mut self) {
         self.workspaces = db::workspaces(self.database.conn()).unwrap_or_default();
         if self.workspaces.is_empty() {
@@ -245,13 +273,50 @@ impl App {
     /// so navigation keys must never call it.
     fn rescan_workspace_data(&mut self) {
         if let Some(ws) = self.active_workspace().cloned() {
-            self.packages = package::scan(&ws).unwrap_or_default();
-            self.git = git::snapshot(&ws.path).unwrap_or_default();
-            self.outputs = release::list(&ws).unwrap_or_default();
+            match package::scan(&ws) {
+                Ok(packages) => self.packages = packages,
+                Err(error) => {
+                    self.packages.clear();
+                    self.notify(
+                        NoticeLevel::Warning,
+                        format!("could not scan packages: {error}"),
+                    );
+                }
+            }
+            match git::snapshot(&ws.path) {
+                Ok(snapshot) => self.git = snapshot,
+                Err(error) => {
+                    self.git = GitSnapshot::default();
+                    self.notify(
+                        NoticeLevel::Warning,
+                        format!("could not read git state: {error}"),
+                    );
+                }
+            }
+            match release::list(&ws) {
+                Ok(outputs) => self.outputs = outputs,
+                Err(error) => {
+                    self.outputs.clear();
+                    self.notify(
+                        NoticeLevel::Warning,
+                        format!("could not list built packages: {error}"),
+                    );
+                }
+            }
         } else {
             self.packages.clear();
             self.outputs.clear();
             self.git = GitSnapshot::default();
+        }
+        self.workspace_data_loaded = true;
+    }
+
+    /// Load the expensive workspace data only when a screen or command needs
+    /// it. On a real `void-packages` tree this avoids scanning ~15k templates
+    /// before the first frame is drawn.
+    fn ensure_workspace_data(&mut self) {
+        if !self.workspace_data_loaded && self.active_workspace().is_some() {
+            self.rescan_workspace_data();
         }
     }
 
@@ -263,7 +328,17 @@ impl App {
             .min(self.filtered_packages().len().saturating_sub(1));
         if let Some(ws) = self.active_workspace().cloned() {
             if let Some(pkg) = self.selected_package() {
-                self.template = package::parse_template(&pkg.path.join("template")).ok();
+                let path = pkg.path.join("template");
+                let cache_key = fs::metadata(&path)
+                    .ok()
+                    .and_then(|meta| Some((path.clone(), meta.modified().ok()?, meta.len())));
+                if cache_key != self.template_cache {
+                    self.template = package::parse_template(&path).ok();
+                    self.template_cache = cache_key;
+                    // Findings belong to the previously selected template.
+                    self.findings.clear();
+                    self.diagnostic_index = 0;
+                }
                 if let Some(info) = &self.template {
                     self.dependencies = deps::for_package(&ws, info, self.settings.check_installed)
                         .unwrap_or_default();
@@ -273,11 +348,13 @@ impl App {
                 self.patches = patches::list(&ws, &pkg.name).unwrap_or_default();
             } else {
                 self.template = None;
+                self.template_cache = None;
                 self.dependencies.clear();
                 self.patches.clear();
             }
         } else {
             self.template = None;
+            self.template_cache = None;
             self.dependencies.clear();
             self.patches.clear();
         }
@@ -289,6 +366,17 @@ impl App {
     }
 
     fn switch_screen(&mut self, screen: Screen) {
+        if matches!(
+            screen,
+            Screen::Packages
+                | Screen::Template
+                | Screen::Dependencies
+                | Screen::Patches
+                | Screen::BuildCenter
+                | Screen::Git
+        ) {
+            self.ensure_workspace_data();
+        }
         self.screen = screen;
         self.refresh_selection();
     }
@@ -370,15 +458,24 @@ impl App {
                 }
                 self.builds = db::builds(self.database.conn(), 100).unwrap_or_default();
                 if status == "failed" {
-                    if let Ok(found) = diagnostics::analyze(&log_path) {
-                        self.findings = found;
-                        self.diagnostic_index = 0;
+                    match diagnostics::analyze(&log_path) {
+                        Ok(found) => {
+                            self.findings = found;
+                            self.diagnostic_index = 0;
+                            self.screen = Screen::Diagnostics;
+                            self.notify(
+                                NoticeLevel::Error,
+                                format!("build failed (exit {:?}), diagnostics opened", code),
+                            );
+                        }
+                        Err(error) => self.notify(
+                            NoticeLevel::Error,
+                            format!(
+                                "build failed (exit {:?}); log analysis failed: {error}",
+                                code
+                            ),
+                        ),
                     }
-                    self.screen = Screen::Diagnostics;
-                    self.notify(
-                        NoticeLevel::Error,
-                        format!("build failed (exit {:?}), diagnostics opened", code),
-                    );
                 } else {
                     self.notify(
                         NoticeLevel::Success,
@@ -457,11 +554,20 @@ impl App {
             Action::ApplyPatch { patch, reverse } => {
                 let (ws, _, info) = self.selected_template()?;
                 let backups = patches::apply(&ws, &info, &patch, reverse)?;
-                Ok(format!(
-                    "patch {} applied; {} backup(s) created",
-                    patch.display(),
-                    backups.len()
-                ))
+                self.refresh_selection();
+                let verb = if reverse { "reverted" } else { "applied" };
+                if backups.is_empty() {
+                    Ok(format!(
+                        "patch {} {verb}; no existing files were backed up",
+                        patch.display()
+                    ))
+                } else {
+                    Ok(format!(
+                        "patch {} {verb}; {} backup(s) created next to the modified files",
+                        patch.display(),
+                        backups.len()
+                    ))
+                }
             }
             Action::GitPull { remote, branch } => {
                 let ws = self.workspace_mut()?;
@@ -500,13 +606,17 @@ impl App {
                 Ok(format!("repository indexed: {output}"))
             }
             Action::CleanBuild(name) => {
+                // start_build already notifies; a second notice would be noise.
                 self.start_build(&name, BuildOp::Clean)?;
-                Ok("clean started".into())
+                Ok(String::new())
             }
             Action::Quit => {
                 // Make the confirmation honest: terminate the process group
                 // before leaving so no xbps-src child is left behind.
                 self.builds_manager.cancel_all();
+                if let Some(id) = self.active_build_id.take() {
+                    let _ = db::record_build_finish(self.database.conn(), id, "cancelled", "", 0);
+                }
                 self.running = false;
                 Ok("exiting".into())
             }
@@ -518,6 +628,12 @@ impl App {
         let tokens = tokenize(input);
         if tokens.is_empty() {
             return Ok(String::new());
+        }
+        if matches!(
+            tokens[0].as_str(),
+            "pkg" | "template" | "deps" | "patch" | "build" | "source" | "git" | "release"
+        ) {
+            self.ensure_workspace_data();
         }
         match tokens[0].as_str() {
             "help" | "?" => {
@@ -537,13 +653,15 @@ impl App {
                 Ok(String::new())
             }
             "filter" => {
-                self.filter = tokens.get(1).cloned().unwrap_or_default();
+                self.filter = tokens[1..].join(" ");
                 self.package_index = 0;
-                self.refresh_all();
+                self.refresh_selection();
                 Ok(format!("filter: {}", self.filter))
             }
             "theme" => {
-                let theme = ThemeName::parse(tokens.get(1).map(String::as_str).unwrap_or("dark"));
+                let value = tokens.get(1).map(String::as_str).unwrap_or("dark");
+                let theme = ThemeName::parse_checked(value)
+                    .ok_or_else(|| invalid("theme must be dark or light"))?;
                 self.settings.theme = theme;
                 self.settings.save(self.database.conn())?;
                 Ok(format!("theme set to {}", theme.as_str()))
@@ -591,6 +709,7 @@ impl App {
                             "No runtime dependency cycle was detected",
                         ));
                     }
+                    self.diagnostic_index = 0;
                     self.screen = Screen::Diagnostics;
                     Ok("cycle analysis complete".into())
                 } else {
@@ -609,7 +728,7 @@ impl App {
                     .get(1)
                     .and_then(|value| screen_from_name(value))
                     .ok_or_else(|| invalid("unknown screen"))?;
-                self.screen = screen;
+                self.switch_screen(screen);
                 Ok(format!("viewing {}", screen.label()))
             }
             other => Err(invalid(format!("unknown command `{other}`; run :help"))),
@@ -623,9 +742,9 @@ impl App {
                     .get(2)
                     .ok_or_else(|| invalid("usage: workspace add <path>"))?;
                 let ws = workspace::add(self.database.conn(), path)?;
+                self.active_ws = Some(self.workspaces.len());
                 self.refresh_all();
                 self.active_ws = self.workspaces.iter().position(|item| item.id == ws.id);
-                self.refresh_all();
                 Ok(format!("workspace {} added (valid={})", ws.name, ws.valid))
             }
             Some("clone") => {
@@ -634,9 +753,9 @@ impl App {
                     .ok_or_else(|| invalid("usage: workspace clone <url> [name]"))?;
                 let ws =
                     workspace::clone(self.database.conn(), url, tokens.get(3).map(String::as_str))?;
+                self.active_ws = Some(self.workspaces.len());
                 self.refresh_all();
                 self.active_ws = self.workspaces.iter().position(|item| item.id == ws.id);
-                self.refresh_all();
                 Ok(format!("cloned into {}", ws.path.display()))
             }
             Some("use") => {
@@ -678,6 +797,7 @@ impl App {
                     .filter(|item| item.severity == Severity::Error)
                     .count();
                 self.findings = findings;
+                self.diagnostic_index = 0;
                 self.screen = Screen::Diagnostics;
                 Ok(format!("workspace validation: {errors} error(s)"))
             }
@@ -814,14 +934,11 @@ impl App {
                     .get(2)
                     .ok_or_else(|| invalid("usage: patch apply <name>"))?;
                 let ws = self.workspace_mut()?;
-                let patch = patches::patch_dir(
-                    &ws,
-                    &self
-                        .selected_package()
-                        .ok_or_else(|| invalid("no package"))?
-                        .name,
-                )
-                .join(patch_name);
+                let package_name = self
+                    .selected_package()
+                    .ok_or_else(|| invalid("no package"))?
+                    .name;
+                let patch = patches::patch_path(&ws, &package_name, patch_name)?;
                 if !patch.is_file() {
                     return Err(invalid("patch not found"));
                 }
@@ -841,14 +958,11 @@ impl App {
                     .get(2)
                     .ok_or_else(|| invalid("usage: patch remove <name>"))?;
                 let ws = self.workspace_mut()?;
-                let patch = patches::patch_dir(
-                    &ws,
-                    &self
-                        .selected_package()
-                        .ok_or_else(|| invalid("no package"))?
-                        .name,
-                )
-                .join(patch_name);
+                let package_name = self
+                    .selected_package()
+                    .ok_or_else(|| invalid("no package"))?
+                    .name;
+                let patch = patches::patch_path(&ws, &package_name, patch_name)?;
                 self.confirm(
                     "Remove patch?",
                     "The patch file will be deleted from srcpkgs.",
@@ -872,10 +986,7 @@ impl App {
                 Ok("termination signal sent to active build".into())
             }
             Some("logs") => {
-                let index: usize = tokens
-                    .get(2)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
+                let index = parse_index(tokens, 0)?;
                 let build = self
                     .builds
                     .get(index)
@@ -949,10 +1060,7 @@ impl App {
             Some("download") => {
                 let ws = self.workspace_mut()?;
                 let (_, _, info) = self.selected_template()?;
-                let index: usize = tokens
-                    .get(2)
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
+                let index = parse_index(tokens, 0)?;
                 let path = source::download(&ws.path, &info, index)?;
                 Ok(format!("downloaded {}", path.display()))
             }
@@ -1016,6 +1124,7 @@ impl App {
     }
 
     fn command_git(&mut self, tokens: &[String]) -> Result<String> {
+        self.ensure_workspace_data();
         let ws = self.workspace_mut()?;
         let remote = tokens.get(2).cloned().unwrap_or_else(|| {
             ws.remotes
@@ -1095,6 +1204,9 @@ impl App {
                     .get(3)
                     .cloned()
                     .unwrap_or_else(|| self.git.branch.clone());
+                if branch == "detached" {
+                    return Err(invalid("check out a branch before pulling"));
+                }
                 self.confirm(
                     "Pull from remote?",
                     format!("Fast-forward pull from {remote}/{branch}"),
@@ -1107,6 +1219,9 @@ impl App {
                     .get(3)
                     .cloned()
                     .unwrap_or_else(|| self.git.branch.clone());
+                if branch == "detached" {
+                    return Err(invalid("check out a branch before pushing"));
+                }
                 self.confirm(
                     "Push to remote?",
                     format!("This will update {remote}/{branch} externally."),
@@ -1122,6 +1237,7 @@ impl App {
     }
 
     fn command_release(&mut self, tokens: &[String]) -> Result<String> {
+        self.ensure_workspace_data();
         match tokens.get(1).map(String::as_str) {
             Some("list") => {
                 self.screen = Screen::BuildCenter;
@@ -1152,21 +1268,37 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> KeyOutcome {
         if self.confirm.is_some() {
+            let ctrl_c =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
             match key.code {
                 KeyCode::Enter => {
                     let confirm = self.confirm.take().unwrap();
                     match self.apply_action(confirm.action) {
-                        Ok(message) => self.notify(NoticeLevel::Success, message),
+                        Ok(message) => {
+                            if !message.is_empty() {
+                                self.notify(NoticeLevel::Success, message);
+                            }
+                        }
                         Err(error) => self.notify(NoticeLevel::Error, error.to_string()),
                     }
                 }
-                KeyCode::Esc => self.confirm = None,
+                KeyCode::Esc | KeyCode::Char('q') => self.confirm = None,
                 _ => {}
+            }
+            if ctrl_c {
+                self.confirm = None;
+                self.request_quit();
             }
             return KeyOutcome::Continue;
         }
 
         if self.command_mode {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.command_mode = false;
+                self.command.clear();
+                self.request_quit();
+                return KeyOutcome::Continue;
+            }
             match key.code {
                 KeyCode::Char(c) => self.command.push(c),
                 KeyCode::Backspace => {
@@ -1245,6 +1377,7 @@ impl App {
             }
             KeyCode::Char('e') => {
                 if self.screen == Screen::Template || self.screen == Screen::Packages {
+                    self.ensure_workspace_data();
                     match self.selected_template() {
                         Ok((_, pkg, _)) => {
                             let path = pkg.path.join("template");
@@ -1259,6 +1392,7 @@ impl App {
                 Err(error) => self.notify(NoticeLevel::Error, error.to_string()),
             },
             KeyCode::Char('b') => {
+                self.ensure_workspace_data();
                 let name = self.selected_package().map(|item| item.name);
                 if let Some(name) = name {
                     let op = self.selected_op();
@@ -1266,6 +1400,11 @@ impl App {
                         Ok(()) => {}
                         Err(error) => self.notify(NoticeLevel::Error, error.to_string()),
                     }
+                } else {
+                    self.notify(
+                        NoticeLevel::Warning,
+                        "no package selected; open the Packages screen first",
+                    );
                 }
             }
             KeyCode::Char('x') => {
@@ -1340,6 +1479,9 @@ impl App {
     }
 
     fn activate(&mut self) {
+        if matches!(self.screen, Screen::BuildCenter) {
+            self.ensure_workspace_data();
+        }
         match self.screen {
             Screen::Packages => self.switch_screen(Screen::Template),
             Screen::BuildCenter => {
@@ -1385,6 +1527,15 @@ fn screen_from_name(name: &str) -> Option<Screen> {
         "git" => Some(Screen::Git),
         "settings" => Some(Screen::Settings),
         _ => None,
+    }
+}
+
+fn parse_index(tokens: &[String], default: usize) -> Result<usize> {
+    match tokens.get(2) {
+        Some(value) => value
+            .parse()
+            .map_err(|_| invalid("index must be a non-negative number")),
+        None => Ok(default),
     }
 }
 

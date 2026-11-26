@@ -91,18 +91,24 @@ pub fn analyze(path: &Path) -> Result<Vec<Finding>> {
     let mut counts: Vec<usize> = vec![0; RULES.len()];
 
     for (index, line) in reader.lines().enumerate() {
-        let line = line?;
+        let line = line?.trim_end_matches('\r').to_string();
         tail.push_back(line.clone());
         if tail.len() > 12 {
             tail.pop_front();
         }
+        // Several rules overlap (for example "cannot find -l" matches both
+        // dependency and linker patterns). Report each log line once, with the
+        // most specific rule, and keep this bounded on very noisy logs.
+        let mut matched = false;
         for (rule_index, (regex, rule)) in compiled().iter().enumerate() {
-            if counts[rule_index] >= 4 || !regex.is_match(&line) {
+            if matched || counts[rule_index] >= 4 || findings.len() >= 24 || !regex.is_match(&line)
+            {
                 continue;
             }
             counts[rule_index] += 1;
+            matched = true;
             findings.push(
-                Finding::error(rule.title, format!("{}. {}", rule.cause, rule.suggestion))
+                Finding::inferred(rule.title, format!("{}. {}", rule.cause, rule.suggestion))
                     .at_line(index + 1)
                     .with_evidence(line.trim().chars().take(240).collect::<String>()),
             );

@@ -130,8 +130,19 @@ pub fn clone(conn: &Connection, url: &str, name: Option<&str>) -> Result<Workspa
             destination.display()
         )));
     }
-    git::clone(url, &destination)?;
-    add(conn, &destination.to_string_lossy())
+    if let Err(error) = git::clone(url, &destination) {
+        let _ = std::fs::remove_dir_all(&destination);
+        return Err(error);
+    }
+    match add(conn, &destination.to_string_lossy()) {
+        Ok(workspace) => Ok(workspace),
+        Err(error) => {
+            // Do not leave an unregistered half-cloned tree behind: it would
+            // make a corrected retry fail with "destination already exists".
+            let _ = std::fs::remove_dir_all(&destination);
+            Err(error)
+        }
+    }
 }
 
 pub fn refresh(conn: &Connection, workspace: &Workspace) -> Result<Workspace> {

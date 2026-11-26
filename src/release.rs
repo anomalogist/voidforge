@@ -61,22 +61,57 @@ pub fn index(workspace: &Workspace) -> Result<String> {
     if !dir.is_dir() {
         return Err(crate::error::invalid("no binpkgs directory"));
     }
-    let output = Command::new("xbps-rindex").arg("-a").arg(&dir).output()?;
-    if !output.status.success() {
+    // xbps-rindex expects archive files, not a directory: passing the directory
+    // exits successfully while registering nothing. `-f` also refreshes
+    // packages that were rebuilt with the same version.
+    let mut archives: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("xbps")
+        })
+        .collect();
+    if archives.is_empty() {
+        return Err(crate::error::invalid(format!(
+            "no .xbps packages found in {}",
+            dir.display()
+        )));
+    }
+    archives.sort();
+    let absolute: Vec<String> = archives
+        .iter()
+        .map(|path| {
+            path.canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let mut command = Command::new("xbps-rindex");
+    command.arg("-a").arg("-f").args(&absolute);
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() || stdout.contains("index: 0 packages registered") {
         return Err(Error::Command {
-            cmd: format!("xbps-rindex -a {}", dir.display()),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            cmd: format!("xbps-rindex -a -f {} package(s)", archives.len()),
+            message: format!("{stdout} {stderr}").trim().to_string(),
             code: output.status.code(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(stdout)
 }
 
 pub fn metadata(dir: &Path, name: &str) -> Result<String> {
     let repo = format!("--repository={}", dir.display());
     let output = Command::new("xbps-query")
         .arg(&repo)
-        .args(["-p", "pkgver,size,arch,license,shortdesc", name])
+        .args([
+            "-p",
+            "pkgver,filename-size,architecture,license,short_desc",
+            "--",
+            name,
+        ])
         .output()?;
     if !output.status.success() {
         return Err(Error::Command {

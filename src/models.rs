@@ -137,6 +137,20 @@ impl Finding {
         }
     }
 
+    /// A pattern-based guess from a log line. It has evidence, but it is not a
+    /// verified inspection of a file or a process result, so `verified` stays
+    /// false and the UI shows it as inferred.
+    pub fn inferred(title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            title: title.into(),
+            detail: detail.into(),
+            evidence: None,
+            line: None,
+            verified: false,
+        }
+    }
+
     pub fn info(title: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             severity: Severity::Info,
@@ -184,6 +198,8 @@ pub struct Dependency {
     pub kind: DepKind,
     pub in_repository: bool,
     pub installed: bool,
+    /// Virtual dependencies are satisfied by a provider's `provides` field.
+    pub virtual_dep: bool,
     pub detail: Option<String>,
 }
 

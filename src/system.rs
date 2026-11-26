@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sysinfo::{Disks, System};
@@ -34,18 +34,23 @@ pub fn parse_os_release(contents: &str) -> HashMap<String, String> {
 }
 
 fn detect_libc() -> String {
-    for candidate in [
-        "/lib/ld-musl-x86_64.so.1",
-        "/lib/ld-linux-x86-64.so.2",
-        "/lib64/ld-linux-x86-64.so.2",
-    ] {
-        if PathBuf::from(candidate).exists() {
-            return if candidate.contains("musl") {
-                "musl".into()
-            } else {
-                "glibc".into()
-            };
-        }
+    // glibc takes priority: a glibc host can have a musl loader installed for
+    // cross builds, but it is not a musl system.
+    let glibc: &[&str] = match std::env::consts::ARCH {
+        "x86_64" => &["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-x86-64.so.2"],
+        "aarch64" => &["/lib/ld-linux-aarch64.so.1", "/lib64/ld-linux-aarch64.so.1"],
+        _ => &[],
+    };
+    if glibc.iter().any(|path| Path::new(path).exists()) {
+        return "glibc".into();
+    }
+    let musl = match std::env::consts::ARCH {
+        "x86_64" => Some("/lib/ld-musl-x86_64.so.1"),
+        "aarch64" => Some("/lib/ld-musl-aarch64.so.1"),
+        _ => None,
+    };
+    if musl.is_some_and(|path| Path::new(path).exists()) {
+        return "musl".into();
     }
     "unknown".into()
 }
@@ -137,22 +142,29 @@ pub fn detect_tools(scopes: &[ToolScope]) -> Vec<ToolStatus> {
 }
 
 fn version_of(path: &PathBuf) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // A broken tool must never be able to hang startup. `timeout` is part of
+    // coreutils on Void and on common CI runners; fall back if unavailable.
+    let output = Command::new("timeout")
+        .args(["5", "--"])
+        .arg(path)
+        .arg("--version")
+        .output()
+        .or_else(|_| Command::new(path).arg("--version").output())
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
     text.lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .find(|line| !line.is_empty() && line.chars().any(|ch| ch.is_ascii_digit()))
         .map(|line| line.chars().take(90).collect())
 }
 
 pub fn sample_metrics(system: &mut System, disks: &mut Disks) -> SystemMetrics {
     system.refresh_cpu_all();
     system.refresh_memory();
-    disks.refresh(false);
+    disks.refresh(true);
     SystemMetrics {
         cpu_percent: system.global_cpu_usage(),
         memory_total: system.total_memory(),
@@ -185,13 +197,15 @@ mod tests {
 
     #[test]
     fn host_is_detected() {
-        // Runs on Void and on generic CI runners alike: detection must always
-        // succeed, and the `supported` flag must agree with the detected ID.
+        // Works on Void, on generic CI runners, and on minimal systems without
+        // /etc/os-release: detection must be consistent with what it found.
         let host = detect_host();
-        assert!(!host.os_id.is_empty());
-        assert_eq!(host.supported, host.os_id == "void", "{:?}", host.reason);
         if host.supported {
+            assert_eq!(host.os_id, "void");
             assert!(host.reason.is_none());
+        } else if host.os_id == "void" {
+            // Unsupported architecture or libc is a valid reason.
+            assert!(host.reason.is_some(), "{:?}", host);
         }
     }
 }

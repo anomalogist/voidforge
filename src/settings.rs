@@ -11,12 +11,20 @@ pub enum ThemeName {
 }
 
 impl ThemeName {
-    pub fn parse(value: &str) -> Self {
+    pub fn parse_checked(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("light") {
-            Self::Light
+            Some(Self::Light)
+        } else if value.eq_ignore_ascii_case("dark") {
+            Some(Self::Dark)
         } else {
-            Self::Dark
+            None
         }
+    }
+
+    /// Persisted values are trusted; unknown values fall back to the default.
+    /// User input goes through `parse_checked` so typos are reported instead.
+    pub fn parse(value: &str) -> Self {
+        Self::parse_checked(value).unwrap_or(Self::Dark)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -42,7 +50,8 @@ impl Settings {
             .map(|value| ThemeName::parse(&value))
             .unwrap_or(ThemeName::Dark);
         let jobs = db::get_setting(conn, "jobs")?
-            .and_then(|value| value.parse().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 64))
             .unwrap_or_else(default_jobs);
         let editor = db::get_setting(conn, "editor")?
             .filter(|value| !value.is_empty())

@@ -9,11 +9,7 @@ use crate::models::{DepKind, Dependency, TemplateInfo, Workspace};
 use crate::package;
 
 fn clean_name(raw: &str) -> String {
-    raw.split(['<', '>', '=', '(', ')'])
-        .next()
-        .unwrap_or(raw)
-        .trim()
-        .to_string()
+    package::dependency_name(raw)
 }
 
 pub fn repository_names(workspace: &Workspace) -> HashSet<String> {
@@ -42,9 +38,11 @@ pub fn installed_packages() -> Vec<String> {
 }
 
 fn is_installed(name: &str, installed: &[String]) -> bool {
+    // `xbps-query -l` reports full package versions (`foo-1.2.3_1`). A plain
+    // prefix match used to claim `foo` was installed when only `foo-bar` was.
     installed
         .iter()
-        .any(|entry| entry == name || entry.starts_with(&format!("{name}-")))
+        .any(|entry| package::dependency_name(entry) == name)
 }
 
 pub fn for_package(
@@ -70,6 +68,7 @@ pub fn for_package(
             if name.is_empty() {
                 continue;
             }
+            let virtual_dep = raw.trim_start().starts_with("virtual?");
             let detail = if raw != name {
                 Some(format!("requested as {raw}"))
             } else {
@@ -82,6 +81,7 @@ pub fn for_package(
                 kind: kind.clone(),
                 in_repository,
                 installed: installed_package,
+                virtual_dep,
                 detail,
             });
         }
@@ -109,16 +109,58 @@ pub fn possible_cycles(workspace: &Workspace) -> Vec<Vec<String>> {
         let Ok(raw) = fs::read_to_string(&template) else {
             continue;
         };
+        // Subpackages are symlinks to their real package. Including them as
+        // separate graph nodes repeats their parent's dependencies and can
+        // create phantom cycles.
+        if fs::symlink_metadata(entry.path())
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         // Full template parsing runs shell expansion and is far too slow for
         // the 15k templates in a real void-packages tree. Cycle detection
-        // only needs literal dependency names, so read those directly.
-        let deps: Vec<String> = package::summary_value(&raw, "depends")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(clean_name)
-            .filter(|value| !value.is_empty() && srcpkgs.join(value).is_dir())
-            .collect();
+        // only needs literal dependency names, so read those directly in one
+        // pass over the logical lines.
+        let values = package::summary_values(
+            &raw,
+            &["depends", "makedepends", "hostmakedepends", "checkdepends"],
+        );
+        let mut deps: Vec<String> = Vec::new();
+        for value in values.values() {
+            for raw_dep in value.split_whitespace() {
+                let dep = clean_name(raw_dep);
+                if dep.is_empty() {
+                    continue;
+                }
+                let path = srcpkgs.join(&dep);
+                if !path.is_dir() {
+                    continue;
+                }
+                let target = if fs::symlink_metadata(&path)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    fs::canonicalize(&path)
+                        .ok()
+                        .filter(|target| {
+                            target
+                                .parent()
+                                .and_then(|parent| parent.file_name())
+                                .is_some_and(|name| name == "srcpkgs")
+                        })
+                        .and_then(|target| Some(target.file_name()?.to_str()?.to_string()))
+                        .unwrap_or_else(|| dep.clone())
+                } else {
+                    dep.clone()
+                };
+                if deps.contains(&target) {
+                    continue;
+                }
+                deps.push(target);
+            }
+        }
         graph.insert(name, deps);
     }
     // The old code silently returned "no cycles" for any real tree (>400
@@ -161,8 +203,18 @@ pub fn possible_cycles(workspace: &Workspace) -> Vec<Vec<String>> {
                 }
                 1 => {
                     if let Some(position) = path.iter().position(|item| item == &dep) {
+                        // Different roots find the same cycle at different
+                        // rotations; normalise it before de-duplicating.
                         let mut cycle = path[position..].to_vec();
-                        cycle.push(dep);
+                        if let Some(pivot) = cycle
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| a.cmp(b))
+                            .map(|(index, _)| index)
+                        {
+                            cycle.rotate_left(pivot);
+                        }
+                        cycle.push(cycle[0].clone());
                         if !cycles.contains(&cycle) {
                             cycles.push(cycle);
                         }
@@ -179,7 +231,7 @@ pub fn summary(workspace: &Workspace, info: &TemplateInfo, check_installed: bool
     let deps = for_package(workspace, info, check_installed).unwrap_or_default();
     let missing: Vec<&Dependency> = deps
         .iter()
-        .filter(|dep| !dep.in_repository && !dep.installed)
+        .filter(|dep| !dep.in_repository && !dep.installed && !dep.virtual_dep)
         .collect();
     format!(
         "{} dependencies, {} unresolved, {} in repository",
@@ -201,7 +253,7 @@ pub fn diagnostics(deps: &[Dependency]) -> Vec<crate::models::Finding> {
                 format!("{} appears twice in {}", dep.name, dep.kind.as_str()),
             ));
         }
-        if !dep.in_repository && !dep.installed {
+        if !dep.in_repository && !dep.installed && !dep.virtual_dep {
             findings.push(
                 Finding::warning(
                     "unresolved dependency",

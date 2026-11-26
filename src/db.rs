@@ -16,6 +16,7 @@ impl Db {
         std::fs::create_dir_all(&directory)?;
         let path = directory.join("voidforge.sqlite3");
         let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(include_str!("../migrations/001_init.sql"))?;
         ensure_workspace_columns(&conn)?;
