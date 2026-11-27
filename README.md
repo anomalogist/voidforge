@@ -8,10 +8,20 @@
 
 
 
-[![CI](https://github.com/anomalogist/voidforge/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalogist/voidforge/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-478A62.svg)](LICENSE)
-[![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-478A62.svg)](https://www.rust-lang.org/)
-[![Void Linux](https://img.shields.io/badge/Target-Void%20Linux-185C3A.svg)](https://voidlinux.org/)
+<p align="center">
+  <a href="https://github.com/anomalogist/voidforge/actions/workflows/ci.yml">
+    <img src="https://github.com/anomalogist/voidforge/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-478A62.svg" alt="License: MIT">
+  </a>
+  <a href="https://www.rust-lang.org/">
+    <img src="https://img.shields.io/badge/Rust-1.89%2B-478A62.svg" alt="Rust 1.89+">
+  </a>
+  <a href="https://voidlinux.org/">
+    <img src="https://img.shields.io/badge/Target-Void%20Linux-185C3A.svg" alt="Void Linux">
+  </a>
+</p>
 
 
 
