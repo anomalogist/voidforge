@@ -2,7 +2,7 @@
 <p align="center">
   <img src="voidforge-icon.png" alt="VoidForge" width="96">
 </p>
-# VoidForge
+<h1>VoidForge</h1>
 
 **The visual package workshop for Void Linux in your terminal.**
 
