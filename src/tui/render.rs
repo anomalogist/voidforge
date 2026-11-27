@@ -245,8 +245,13 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
         ))));
     }
     if activity.is_empty() {
+        let msg = if app.git_loading {
+            " Loading git status in background..."
+        } else {
+            " No builds recorded yet. Press 7 then Enter to build the selected package."
+        };
         activity.push(ListItem::new(Line::from(Span::styled(
-            " No builds recorded yet. Press 7 then Enter to build the selected package.",
+            msg,
             Style::default().fg(theme.muted),
         ))));
     }
@@ -668,8 +673,13 @@ fn render_git(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             )))
         })
         .collect();
+    let title = if app.git_loading {
+        " Working tree (loading...) "
+    } else {
+        " Working tree "
+    };
     frame.render_widget(
-        List::new(items).block(panel(" Working tree ", theme)),
+        List::new(items).block(panel(title, theme)),
         chunks[0],
     );
 

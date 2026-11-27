@@ -77,7 +77,9 @@ fn run_app(terminal: &mut Terminal<Backend>) -> io::Result<()> {
     while app.running {
         terminal.draw(|frame| render::render(frame, &app))?;
 
-        while event::poll(Duration::from_millis(100))? {
+        // Block until an event arrives (no busy-wait polling). This keeps CPU
+        // usage near zero when the user is idle.
+        if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
                     KeyOutcome::Continue => {}

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::models::SystemMetrics;
+use crate::models::{GitSnapshot, SystemMetrics};
 
 #[derive(Clone, Debug)]
 pub enum NoticeLevel {
@@ -28,4 +28,5 @@ pub enum UiEvent {
         level: NoticeLevel,
         message: String,
     },
+    GitSnapshot(GitSnapshot),
 }

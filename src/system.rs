@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use sysinfo::{Disks, System};
 
@@ -142,23 +143,38 @@ pub fn detect_tools(scopes: &[ToolScope]) -> Vec<ToolStatus> {
 }
 
 fn version_of(path: &PathBuf) -> Option<String> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = path.clone();
+    {
+        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = guard.get(&key) {
+            return cached.clone();
+        }
+    }
     // A broken tool must never be able to hang startup. `timeout` is part of
     // coreutils on Void and on common CI runners; fall back if unavailable.
-    let output = Command::new("timeout")
+    let result = Command::new("timeout")
         .args(["5", "--"])
         .arg(path)
         .arg("--version")
         .output()
         .or_else(|_| Command::new(path).arg("--version").output())
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .ok()
+        .and_then(|output| {
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && line.chars().any(|ch| ch.is_ascii_digit()))
+                .map(|line| line.chars().take(90).collect())
+        });
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, result.clone());
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && line.chars().any(|ch| ch.is_ascii_digit()))
-        .map(|line| line.chars().take(90).collect())
+    result
 }
 
 pub fn sample_metrics(system: &mut System, disks: &mut Disks) -> SystemMetrics {

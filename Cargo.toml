@@ -1,6 +1,6 @@
 [package]
 name = "voidforge"
-version = "1.0.0"
+version = "1.0.1"
 description = "The Visual Package Workshop for Void Linux — terminal edition"
 license = "MIT"
 readme = "README.md"

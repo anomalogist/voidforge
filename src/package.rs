@@ -357,15 +357,15 @@ pub fn scan(workspace: &Workspace) -> Result<Vec<PackageEntry>> {
         let Ok(raw) = fs::read_to_string(&template) else {
             continue;
         };
-        let values = summary_values(&raw, &["version", "short_desc", "build_style"]);
+        // Use cheap single-value lookups instead of parsing all fields at once.
         entries.push(PackageEntry {
             name: path
                 .file_name()
                 .map(|value| value.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            version: values.get("version").cloned(),
-            description: values.get("short_desc").cloned(),
-            build_style: values.get("build_style").cloned(),
+            version: summary_value(&raw, "version"),
+            description: summary_value(&raw, "short_desc"),
+            build_style: summary_value(&raw, "build_style"),
             path,
         });
     }

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 use std::time::SystemTime;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -143,6 +144,12 @@ pub struct App {
     /// Parsed template and the file state it came from, so navigation does not
     /// re-parse the same template over and over.
     template_cache: Option<(PathBuf, SystemTime, u64)>,
+    /// Cached tool detection results, keyed by the active workspace path.
+    tools_cache: Option<(Option<PathBuf>, Vec<ToolStatus>)>,
+    /// Cached filtered package list, invalidated when packages or filter change.
+    filtered_cache: Option<(String, usize, Vec<PackageEntry>)>,
+    /// Whether a background git snapshot is currently running.
+    pub git_loading: bool,
 }
 
 impl App {
@@ -192,6 +199,9 @@ impl App {
             edit_request: None,
             workspace_data_loaded: false,
             template_cache: None,
+            tools_cache: None,
+            filtered_cache: None,
+            git_loading: false,
         };
         if !app.workspaces.is_empty() {
             app.active_ws = Some(0);
@@ -205,6 +215,16 @@ impl App {
     }
 
     pub fn filtered_packages(&self) -> Vec<PackageEntry> {
+        // Return cached result when the filter and package list haven't changed.
+        if let Some((ref cached_filter, cached_len, ref cached)) = self.filtered_cache {
+            if *cached_filter == self.filter && cached_len == self.packages.len() {
+                return cached.clone();
+            }
+        }
+        self.compute_filtered_packages()
+    }
+
+    fn compute_filtered_packages(&self) -> Vec<PackageEntry> {
         let query = self.filter.trim().to_ascii_lowercase();
         self.packages
             .iter()
@@ -223,7 +243,8 @@ impl App {
     }
 
     pub fn selected_package(&self) -> Option<PackageEntry> {
-        self.filtered_packages().get(self.package_index).cloned()
+        let filtered = self.filtered_packages();
+        filtered.get(self.package_index).cloned()
     }
 
     pub fn selected_op(&self) -> BuildOp {
@@ -240,13 +261,26 @@ impl App {
         } else {
             self.active_ws = Some(self.active_ws.unwrap_or(0).min(self.workspaces.len() - 1));
         }
-        let scopes: Vec<ToolScope> = self
-            .active_workspace()
-            .map(|ws| vec![ToolScope::Workspace(ws.path.clone())])
-            .unwrap_or_default();
-        self.tools = system::detect_tools(&scopes);
+        self.refresh_tools();
         self.builds = db::builds(self.database.conn(), 100).unwrap_or_default();
         self.refresh_selection();
+    }
+
+    /// Refresh tool detection only when the workspace changed, using a cache.
+    fn refresh_tools(&mut self) {
+        let ws_path = self.active_workspace().map(|ws| ws.path.clone());
+        let cache_valid = self
+            .tools_cache
+            .as_ref()
+            .is_some_and(|(cached_path, _)| *cached_path == ws_path);
+        if !cache_valid {
+            let scopes: Vec<ToolScope> = ws_path
+                .as_ref()
+                .map(|p| vec![ToolScope::Workspace(p.clone())])
+                .unwrap_or_default();
+            self.tools = system::detect_tools(&scopes);
+            self.tools_cache = Some((ws_path, self.tools.clone()));
+        }
     }
 
     /// Full reload: settings, workspaces, package index, git state and the
@@ -258,14 +292,12 @@ impl App {
         } else {
             self.active_ws = Some(self.active_ws.unwrap_or(0).min(self.workspaces.len() - 1));
         }
-        let scopes: Vec<ToolScope> = self
-            .active_workspace()
-            .map(|ws| vec![ToolScope::Workspace(ws.path.clone())])
-            .unwrap_or_default();
-        self.tools = system::detect_tools(&scopes);
+        self.refresh_tools();
         self.builds = db::builds(self.database.conn(), 100).unwrap_or_default();
+        self.filtered_cache = None; // invalidate package filter cache
         self.rescan_workspace_data();
         self.refresh_selection();
+        self.spawn_git_snapshot();
     }
 
     /// Re-read everything that lives inside the selected `void-packages`
@@ -283,16 +315,7 @@ impl App {
                     );
                 }
             }
-            match git::snapshot(&ws.path) {
-                Ok(snapshot) => self.git = snapshot,
-                Err(error) => {
-                    self.git = GitSnapshot::default();
-                    self.notify(
-                        NoticeLevel::Warning,
-                        format!("could not read git state: {error}"),
-                    );
-                }
-            }
+            // Git snapshot is now loaded asynchronously to avoid blocking.
             match release::list(&ws) {
                 Ok(outputs) => self.outputs = outputs,
                 Err(error) => {
@@ -311,6 +334,23 @@ impl App {
         self.workspace_data_loaded = true;
     }
 
+    /// Spawn a background thread to collect git data without blocking the UI.
+    fn spawn_git_snapshot(&mut self) {
+        if self.git_loading {
+            return;
+        }
+        let Some(ws) = self.active_workspace().cloned() else {
+            self.git = GitSnapshot::default();
+            return;
+        };
+        self.git_loading = true;
+        let tx = self.builds_manager.event_sender();
+        thread::spawn(move || {
+            let snapshot = git::snapshot(&ws.path).unwrap_or_default();
+            let _ = tx.send(UiEvent::GitSnapshot(snapshot));
+        });
+    }
+
     /// Load the expensive workspace data only when a screen or command needs
     /// it. On a real `void-packages` tree this avoids scanning ~15k templates
     /// before the first frame is drawn.
@@ -323,9 +363,17 @@ impl App {
     /// Cheap refresh of the currently selected package only. Safe to call on
     /// every selection change or screen switch.
     fn refresh_selection(&mut self) {
-        self.package_index = self
-            .package_index
-            .min(self.filtered_packages().len().saturating_sub(1));
+        // Prime the filtered-package cache once, then reuse it everywhere.
+        let cache_valid = self
+            .filtered_cache
+            .as_ref()
+            .is_some_and(|(f, len, _)| *f == self.filter && *len == self.packages.len());
+        if !cache_valid {
+            let result = self.compute_filtered_packages();
+            self.filtered_cache = Some((self.filter.clone(), self.packages.len(), result));
+        }
+        let filtered_len = self.filtered_cache.as_ref().unwrap().2.len();
+        self.package_index = self.package_index.min(filtered_len.saturating_sub(1));
         if let Some(ws) = self.active_workspace().cloned() {
             if let Some(pkg) = self.selected_package() {
                 let path = pkg.path.join("template");
@@ -430,6 +478,10 @@ impl App {
         match event {
             UiEvent::Metrics(metrics) => {
                 self.set_metrics(metrics);
+            }
+            UiEvent::GitSnapshot(snapshot) => {
+                self.git = snapshot;
+                self.git_loading = false;
             }
             UiEvent::BuildLog { build_id, line } => {
                 if self.active_build_id == Some(build_id) {
@@ -655,6 +707,7 @@ impl App {
             "filter" => {
                 self.filter = tokens[1..].join(" ");
                 self.package_index = 0;
+                self.filtered_cache = None; // invalidate cache
                 self.refresh_selection();
                 Ok(format!("filter: {}", self.filter))
             }
@@ -1134,14 +1187,23 @@ impl App {
         });
         match tokens.get(1).map(String::as_str) {
             Some("status") => {
-                self.git = git::snapshot(&ws.path)?;
+                self.spawn_git_snapshot();
                 self.screen = Screen::Git;
-                Ok(format!("{} changed path(s)", self.git.changes.len()))
+                Ok("git status loading in background...".into())
             }
             Some("diff") => {
-                self.git.diff = git::diff(&ws.path, None)?;
+                // Run diff in background to avoid blocking on huge repos.
+                let ws = self.workspace_mut()?;
+                let tx = self.builds_manager.event_sender();
+                thread::spawn(move || {
+                    let diff = git::diff(&ws.path, None).unwrap_or_default();
+                    let _ = tx.send(UiEvent::Notice {
+                        level: NoticeLevel::Info,
+                        message: format!("diff: {} bytes", diff.len()),
+                    });
+                });
                 self.screen = Screen::Git;
-                Ok(format!("diff: {} bytes", self.git.diff.len()))
+                Ok("git diff loading...".into())
             }
             Some("stage") => {
                 let path = tokens
@@ -1461,10 +1523,12 @@ impl App {
             Screen::Workspaces => {
                 self.active_ws = Some(next);
                 self.package_index = 0;
+                self.filtered_cache = None;
                 // Switching repository is the only case that needs a deep
                 // rescan of templates, git state and built packages.
                 self.rescan_workspace_data();
                 self.refresh_selection();
+                self.spawn_git_snapshot();
             }
             Screen::Packages => {
                 self.package_index = next;

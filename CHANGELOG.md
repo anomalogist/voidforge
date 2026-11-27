@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.1 — 2026-11-27
+
+Performance and responsiveness fix for large `void-packages` trees:
+
+- **Eliminated startup freeze**: Git status snapshot now runs in a background thread instead of blocking the UI for minutes on repositories with thousands of packages. The Git screen shows a "loading..." indicator while data is collected.
+- **Lazy workspace scanning**: Package templates are scanned only when a screen or command actually needs them, not at startup.
+- **Cached tool detection**: Tool availability and versions are cached per workspace instead of being re-detected on every refresh.
+- **Cached package filtering**: Filtered package lists are cached and only recomputed when the filter or package set changes.
+- **Low-idle CPU usage**: The event loop now blocks on terminal events instead of busy-polling every 100 ms.
+- Tool version lookups are cached across the process lifetime.
+
+Quality gate: 28 unit tests and 5 integration tests pass; release build succeeds.
+
 ## 1.0.0 — 2026-11-27
 
 First stable public release.
