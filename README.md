@@ -10,18 +10,19 @@
 
 <p align="center">
   <a href="https://github.com/anomalogist/voidforge/actions/workflows/ci.yml">
-    <img src="https://github.com/anomalogist/voidforge/actions/workflows/ci.yml/badge.svg" alt="CI Status">
+    <img src="https://github.com/anomalogist/voidforge/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
   <a href="LICENSE">
-    <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT">
+    <img src="https://badgen.net/badge/license/MIT/green" alt="License: MIT">
   </a>
   <a href="https://www.rust-lang.org/">
-    <img src="https://img.shields.io/badge/Rust-1.89%2B-green.svg" alt="Rust 1.89+">
+    <img src="https://badgen.net/badge/Rust/1.89%2B/green" alt="Rust 1.89+">
   </a>
   <a href="https://voidlinux.org/">
-    <img src="https://img.shields.io/badge/Target-Void_Linux-darkgreen.svg" alt="Target: Void Linux">
+    <img src="https://badgen.net/badge/Target/Void%20Linux/darkgreen" alt="Void Linux">
   </a>
 </p>
+
 
 
 
