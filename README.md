@@ -6,10 +6,12 @@
 
 **The visual package workshop for Void Linux in your terminal.**
 
+
 [![CI](https://github.com/anomalogist/voidforge/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalogist/voidforge/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
-[![Void Linux](https://img.shields.io/badge/target-Void%20Linux-%23e60053.svg)](https://voidlinux.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-478A62.svg)](LICENSE)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-478A62.svg)](https://www.rust-lang.org/)
+[![Void Linux](https://img.shields.io/badge/target-Void%20Linux-185C3A.svg)](https://voidlinux.org/)
+
 
 **Stable 1.0.0 · MIT license · No web server · No mock data**
 
