@@ -1,8 +1,10 @@
 <div align="center">
-
+<p align="center">
+  <img src="voidforge-icon.png" alt="VoidForge" width="96">
+</p>
 # VoidForge
 
-**The visual package workshop for Void Linux — in your terminal.**
+**The visual package workshop for Void Linux in your terminal.**
 
 [![CI](https://github.com/anomalogist/voidforge/actions/workflows/ci.yml/badge.svg)](https://github.com/anomalogist/voidforge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
