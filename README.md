@@ -31,7 +31,23 @@
 </div>
 
 ---
+<div align="center">
 
+<img src="https://img.shields.io/badge/PROJECT_VISION-2EA043?style=flat-square" alt="Project Vision" />
+
+### More Than a GUI for xbps-src
+
+</div>
+
+I don't see VoidForge as just a graphical interface for `xbps-src`. My long-term vision is to turn it into an **Integrated Package Development Environment for Void Linux**, where developers can manage the entire package lifecycle, from writing templates to building, testing, maintaining packages, and preparing pull requests.
+
+These capabilities are part of the project's long-term vision and will be introduced gradually in future releases.
+
+At the same time, I don't want to sacrifice simplicity or performance for more features. VoidForge should remain fast, lightweight, and intuitive, staying true to the philosophy of Void Linux.
+
+**More capability, without unnecessary complexity.**
+
+but now
 VoidForge is a native Rust terminal application for working on **real Void Linux packages**. It opens your local `void-packages` tree, reads the templates on disk, runs the official `xbps-src` phases, streams the actual build log, and helps you turn failures into useful evidence.
 
 It is a workshop, not a simulator. There is no dashboard server, no embedded browser, and no pretend build output. When VoidForge says a build succeeded, an `xbps-src` process really exited with status 0. When it says a template has a problem, that conclusion comes from the file you are editing.
